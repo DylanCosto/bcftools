@@ -78,6 +78,7 @@ typedef struct
     char *tag;      // the name of the VCF tag: the annot_t.field with the -p prefix
     int idx;        // 0-based index within the VEP annotation string
     int type;       // annotation type, one of the BCF_HT_* types
+    int warned_subdivisions;
     kstring_t str;  // annotation value, ready to pass to bcf_update_info_*
 }
 annot_t;
@@ -749,6 +750,7 @@ static void parse_column_str(args_t *args)
         args->annot = (annot_t*)realloc(args->annot,args->nannot*sizeof(*args->annot));
         annot_t *ann = &args->annot[args->nannot-1];
         ann->type  = BCF_HT_STR;
+        ann->warned_subdivisions = 0;
         ann->idx   = -1;
         ann->field = strdup(args->vep_tag);
         ann->tag   = strdup(args->vep_tag);
@@ -1283,9 +1285,17 @@ static void annot_append(annot_t *ann, char *value)
     if ( ann->str.l ) kputc(',',&ann->str);
     kputs(value, &ann->str);
 }
+static void warn_numeric_subdivisions(annot_t *ann, const char *str)
+{
+    if ( ann->warned_subdivisions || !strchr(str,'&') ) return;
+    fprintf(stderr,"Warning: The numeric annotation %s contains '&'-separated values; only the leading numeric value per transcript is extracted. Use -c %s:Str to preserve all values.\n"
+                   "         This message is printed once for this field.\n",ann->tag,ann->field);
+    ann->warned_subdivisions = 1;
+}
 static inline void parse_array_real(annot_t *ann, char *str, float **arr, int *marr, int *narr)
 {
     static int warned_type_err = 0;
+    warn_numeric_subdivisions(ann,str);
     char *bp = str, *ep;
     float *ptr = *arr;
     int i, n = 1, m = *marr;
@@ -1320,6 +1330,7 @@ static inline void parse_array_real(annot_t *ann, char *str, float **arr, int *m
 static inline void parse_array_int32(annot_t *ann, char *str, int **arr, int *marr, int *narr)
 {
     static int warned_type_err = 0;
+    warn_numeric_subdivisions(ann,str);
     char *bp = str, *ep;
     int32_t *ptr = *arr;
     int i, n = 1, m = *marr;

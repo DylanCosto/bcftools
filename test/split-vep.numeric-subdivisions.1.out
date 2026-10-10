@@ -1,0 +1,9 @@
+Warning: The numeric annotation gnomAD_AF contains '&'-separated values; only the leading numeric value per transcript is extracted. Use -c gnomAD_AF:Str to preserve all values.
+         This message is printed once for this field.
+Warning: The numeric annotation DISTANCE contains '&'-separated values; only the leading numeric value per transcript is extracted. Use -c DISTANCE:Str to preserve all values.
+         This message is printed once for this field.
+1 0.1 5
+2 0.01 3
+3 0.2 7
+4 0.4 9
+5 0.004,0.006 10,12

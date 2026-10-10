@@ -896,6 +896,8 @@ run_test(\&test_vcf_plugin,$opts,in=>'split-vep.select-tr-expr',out=>'select-tr-
 run_test(\&test_vcf_plugin,$opts,in=>'split-vep.select-tr-expr',out=>'select-tr-expr.3.out',cmd=>'+split-vep',args=>qq[-s mane]);
 run_test(\&test_vcf_plugin,$opts,in=>'split-vep.select-tr-expr',out=>'select-tr-expr.3.out',cmd=>'+split-vep',args=>qq[-s primary]);
 run_test(\&test_vcf_plugin,$opts,in=>'split-vep.select-tr-expr',out=>'select-tr-expr.3.out',cmd=>'+split-vep',args=>qq[-s PolyPhen~damaging]);
+run_test(\&test_vcf_plugin,$opts,in=>'split-vep.numeric-subdivisions',out=>'split-vep.numeric-subdivisions.1.out',cmd=>'+split-vep',args=>qq[-f'%POS %gnomAD_AF %DISTANCE\\n' 2>&1]);
+run_test(\&test_vcf_plugin,$opts,in=>'split-vep.numeric-subdivisions',out=>'split-vep.numeric-subdivisions.2.out',cmd=>'+split-vep',args=>qq[-c gnomAD_AF:Str,DISTANCE:Str -f'%POS %gnomAD_AF %DISTANCE\\n' 2>&1]);
 run_test(\&test_vcf_plugin,$opts,in=>'split-vep.types',out=>'split-vep.types.1.out',cmd=>'+split-vep',args=>qq[-f'%cDNA_position %CDS_position %Protein_position']);
 run_test(\&test_vcf_plugin,$opts,in=>'split-vep.types',out=>'split-vep.types.2.out',cmd=>'+split-vep',args=>qq[-f'%cDNA_position %CDS_position %Protein_position' -c cDNA_position:int,CDS_position:int,Protein_position:int]);
 run_test(\&test_vcf_plugin,$opts,in=>'split-vep.filter-missing-bt2098',out=>'split-vep.filter-missing-bt2098.1.out',cmd=>'+split-vep',args=>qq[-e 'gnomad_genomes_AF >= 0.02' | $$opts{bin}/bcftools query -f'%CHROM %POS \t %gnomad_genomes_AF\n']);
