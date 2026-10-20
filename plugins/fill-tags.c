@@ -94,6 +94,7 @@ struct _pop_t
 
 struct _args_t
 {
+    bcf1_t *(*process_record)(bcf1_t *);
     bcf_hdr_t *in_hdr, *out_hdr;
     uint32_t tags, warned;
     int npop, drop_missing, gt_id;
@@ -113,6 +114,8 @@ struct _args_t
 };
 
 static args_t *args;
+static bcf1_t *process_general(bcf1_t *rec);
+static bcf1_t *process_ac_an_only(bcf1_t *rec);
 
 const char *about(void)
 {
@@ -649,6 +652,9 @@ int init(int argc, char **argv, bcf_hdr_t *in, bcf_hdr_t *out)
     for (i=0; i<=max_unpack_bit; i++)
         args->unpack |= 1<<i;
 
+    args->process_record = !(args->tags & ~(SET_AN|SET_AC)) && args->npop==1
+        ? process_ac_an_only : process_general;
+
     return 0;
 }
 
@@ -753,6 +759,53 @@ static int cmpfloat_desc(const void *a, const void *b)
     if ( fa>fb ) return -1;
     return 0;
 }
+// For haploid/diploid AC/AN alone, count alleles directly without classifying
+// genotypes or constructing a per-sample bitset. Higher ploidies must retain
+// the general path's existing distinct-allele counting semantics.
+static void process_ac_an(bcf1_t *rec, bcf_fmt_t *fmt_gt)
+{
+    int i, j, nsmpl = bcf_hdr_nsamples(args->in_hdr);
+    hts_expand(int32_t,rec->n_allele,args->miarr,args->iarr);
+    memset(args->iarr,0,rec->n_allele*sizeof(*args->iarr));
+
+    #define BRANCH_INT(type_t,vector_end) \
+    { \
+        for (i=0; i<nsmpl; i++) \
+        { \
+            type_t *p = (type_t*) (fmt_gt->p + i*fmt_gt->size); \
+            for (j=0; j<fmt_gt->n; j++) \
+            { \
+                if ( p[j]==vector_end ) break; \
+                if ( bcf_gt_is_missing(p[j]) ) continue; \
+                int idx = bcf_gt_allele(p[j]); \
+                if ( idx >= rec->n_allele ) \
+                    error("Incorrect allele (\"%d\") in %s at %s:%"PRId64"\n",idx,args->in_hdr->samples[i],bcf_seqname(args->in_hdr,rec),(int64_t) rec->pos+1); \
+                args->iarr[idx]++; \
+            } \
+        } \
+    }
+    switch (fmt_gt->type) {
+        case BCF_BT_INT8:  BRANCH_INT(int8_t,  bcf_int8_vector_end); break;
+        case BCF_BT_INT16: BRANCH_INT(int16_t, bcf_int16_vector_end); break;
+        case BCF_BT_INT32: BRANCH_INT(int32_t, bcf_int32_vector_end); break;
+        default: error("The GT type is not recognised: %d at %s:%"PRId64"\n",fmt_gt->type, bcf_seqname(args->in_hdr,rec),(int64_t) rec->pos+1); break;
+    }
+    #undef BRANCH_INT
+
+    if ( args->tags & SET_AN )
+    {
+        int32_t an = 0;
+        for (j=0; j<rec->n_allele; j++) an += args->iarr[j];
+        if ( bcf_update_info_int32(args->out_hdr,rec,"AN",&an,1)!=0 )
+            error("Error occurred while updating AN at %s:%"PRId64"\n",bcf_seqname(args->in_hdr,rec),(int64_t) rec->pos+1);
+    }
+    if ( args->tags & SET_AC )
+    {
+        if ( bcf_update_info_int32(args->out_hdr,rec,"AC",args->iarr+1,rec->n_allele-1)!=0 )
+            error("Error occurred while updating AC at %s:%"PRId64"\n",bcf_seqname(args->in_hdr,rec),(int64_t) rec->pos+1);
+    }
+}
+
 static void process_fmt(bcf1_t *rec)
 {
     int i,j, nsmpl = bcf_hdr_nsamples(args->in_hdr);;
@@ -1170,7 +1223,20 @@ static void process_context(bcf1_t *rec)
     }
 }
 
-bcf1_t *process(bcf1_t *rec)
+static bcf1_t *process_ac_an_only(bcf1_t *rec)
+{
+    bcf_unpack(rec, args->unpack);
+    bcf_fmt_t *fmt_gt = NULL;
+    int i;
+    for (i=0; i<rec->n_fmt; i++)
+        if ( rec->d.fmt[i].id==args->gt_id ) { fmt_gt = &rec->d.fmt[i]; break; }
+    if ( !fmt_gt ) return rec;
+    if ( fmt_gt->n>2 ) return process_general(rec);
+    process_ac_an(rec,fmt_gt);
+    return rec;
+}
+
+static bcf1_t *process_general(bcf1_t *rec)
 {
     int i,j;
 
@@ -1213,6 +1279,11 @@ bcf1_t *process(bcf1_t *rec)
         }
     }
     return rec;
+}
+
+bcf1_t *process(bcf1_t *rec)
+{
+    return args->process_record(rec);
 }
 
 void destroy(void)
