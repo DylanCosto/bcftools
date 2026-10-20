@@ -720,6 +720,10 @@ run_test(\&test_vcf_plugin,$opts,in=>'query.variantkey',out=>'query.add-variantk
 run_test(\&test_vcf_plugin,$opts,in=>'query.variantkey',out=>'variantkey-hex.out',cmd=>'+variantkey-hex',args=>'test/');
 run_test(\&test_vcf_plugin,$opts,in=>'query.nucleotide',out=>'query.allele-length.tsv',cmd=>'+allele-length',args=>'');
 run_test(\&test_vcf_plugin,$opts,in=>'fill-tags.smpl.1',out=>'fill-tags.smpl.1.1.out',cmd=>'+fill-tags --no-version',args=>'-- -S {PATH}/fill-tags.smpl.1.txt -t AN,AC');
+run_test(\&test_vcf_plugin,$opts,in=>'fill-tags-counts',out=>'fill-tags-counts.1.out',cmd=>'+fill-tags --no-version',args=>'-- -t AN,AC');
+run_test(\&test_vcf_plugin,$opts,in=>'fill-tags-counts',out=>'fill-tags-counts.1.out',cmd=>'+fill-tags --no-version',args=>'-- -t AC,AN -d');
+run_test(\&test_vcf_plugin,$opts,in=>'fill-tags-counts',out=>'fill-tags-counts.2.out',cmd=>'+fill-tags --no-version',args=>'-- -t AN');
+run_test(\&test_vcf_plugin,$opts,in=>'fill-tags-counts',out=>'fill-tags-counts.3.out',cmd=>'+fill-tags --no-version',args=>'-- -t AC');
 run_test(\&test_vcf_plugin,$opts,in=>'fill-tags-context',out=>'fill-tags-context.out',cmd=>'+fill-tags --no-version',args=>'-- -f {PATH}/fill-tags-context.fa --ctx-len 5 -t CTX,CpG');
 run_test(\&test_vcf_plugin,$opts,in=>'fill-tags.MAC-MAF',out=>'fill-tags.MAC-MAF.1.out',cmd=>'+fill-tags --no-version',args=>q[-- -S {PATH}/fill-tags.3.smpl -t 'MAC:1=MAC' | grep -v ^#]);
 run_test(\&test_vcf_plugin,$opts,in=>'fill-tags.MAC-MAF',out=>'fill-tags.MAC-MAF.1.out',cmd=>'+fill-tags --no-version',args=>q[-- -S {PATH}/fill-tags.3.smpl -t 'MAC:1=int(MAF*AN)' | grep -v ^#]);
