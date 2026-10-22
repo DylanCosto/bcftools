@@ -40,6 +40,10 @@ DEALINGS IN THE SOFTWARE.  */
 #include <htslib/kstring.h>
 #include <htslib/khash_str2int.h>
 #include <htslib/hts_os.h>
+#include <htslib/hts_endian.h>
+#include <htslib/bgzf.h>
+#include <htslib/hfile.h>
+#include <pthread.h>
 #include <assert.h>
 #include "regidx.h"
 #include "bcftools.h"
@@ -108,6 +112,11 @@ typedef struct {
     int write_index;
     char *index_fn;
     progress_t *progress;
+    struct _mplp_chunk_res_t *par_res;  // when set, records are serialized here instead of written (see mpileup_parallel)
+    bcf1_t *par_rec;
+    unsigned short par_rng[3], par_rng_cur[3];  // random number generator state at the chunk start
+    uint64_t par_ndraw;                         // random numbers drawn in the chunk
+    int par_is_vcf, par_chunk_size;
 } mplp_conf_t;
 
 typedef struct {
@@ -127,6 +136,10 @@ struct _mplp_aux_t {
     const mplp_conf_t *conf;
     int bam_id;
     hts_idx_t *idx;     // maintained only with more than one -r regions
+    // used by mpileup_parallel to verify that reads starting before the
+    // processing start cannot influence emitted records
+    int track;
+    hts_pos_t proc_beg, taint_end, max_span;
 };
 
 // Data passed to htslib/mpileup
@@ -269,20 +282,11 @@ static int mplp_func(void *data, bam1_t *b)
                 bam_aux_append(b, "_Q", 'Z', b->core.l_qseq+1, ZQ);
                 free(ZQ);
             } else {
-                static uint8_t ZQ[501] =
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                    "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@";
+                // a local buffer: this function runs concurrently with --threads
+                uint8_t ZQ[501];
+                memset(ZQ, '@', b->core.l_qseq);
                 ZQ[b->core.l_qseq] = 0;
                 bam_aux_append(b, "_Q", 'Z', b->core.l_qseq+1, ZQ);
-                ZQ[b->core.l_qseq] = '@';
             }
         }
 
@@ -294,6 +298,12 @@ static int mplp_func(void *data, bam1_t *b)
         if (b->core.qual < ma->conf->min_mq) continue;
         else if ((ma->conf->flag&MPLP_NO_ORPHAN) && (b->core.flag&BAM_FPAIRED) && !(b->core.flag&BAM_FPROPER_PAIR)) continue;
 
+        if ( ma->track )
+        {
+            hts_pos_t end = bam_endpos(b);
+            if ( ma->max_span < end - b->core.pos ) ma->max_span = end - b->core.pos;
+            if ( b->core.pos < ma->proc_beg && ma->taint_end < end ) ma->taint_end = end;
+        }
         return ret;
     }
     return ret;
@@ -379,8 +389,57 @@ static void group_smpl(mplp_pileup_t *m, bam_smpl_t *bsmpl, int n, int *n_plp, c
     }
 }
 
+typedef struct _mplp_chunk_res_t
+{
+    kstring_t buf;          // records serialized in the output format
+    int *len, nlen, mlen;   // length of each record, needed only for BGZF-compressed VCF
+}
+mplp_chunk_res_t;
+
+// Serialize a record exactly as bcf_write() would, so that the main thread
+// can later output the bytes of a whole chunk at once
+static void mplp_serialize_rec(mplp_conf_t *conf, bcf_hdr_t *hdr, bcf1_t *rec)
+{
+    mplp_chunk_res_t *res = conf->par_res;
+    size_t l0 = res->buf.l;
+    if ( conf->par_is_vcf )
+    {
+        if ( vcf_format1(hdr, rec, &res->buf)!=0 ) error("[%s] Error: failed to format the record\n", __func__);
+    }
+    else
+    {
+        // bcf_copy() packs the modified record like bcf_write() does
+        rec = bcf_copy(conf->par_rec, rec);
+        if ( rec->pos > INT32_MAX || rec->rlen > INT32_MAX ) error("[%s] Error: 64-bit values not representable in BCF\n", __func__);
+        uint8_t x[32];
+        u32_to_le(rec->shared.l + 24, x);
+        u32_to_le(rec->indiv.l, x + 4);
+        i32_to_le(rec->rid, x + 8);
+        u32_to_le(rec->pos, x + 12);
+        u32_to_le(rec->rlen, x + 16);
+        float_to_le(rec->qual, x + 20);
+        u16_to_le(rec->n_info, x + 24);
+        u16_to_le(rec->n_allele, x + 26);
+        u32_to_le((uint32_t)rec->n_fmt<<24 | (rec->n_sample & 0xffffff), x + 28);
+        if ( kputsn((char*)x, 32, &res->buf)<0 ||
+             kputsn(rec->shared.s, rec->shared.l, &res->buf)<0 ||
+             kputsn(rec->indiv.s, rec->indiv.l, &res->buf)<0 ) error("[%s] Error: out of memory\n", __func__);
+    }
+    if ( conf->par_is_vcf==2 )
+    {
+        hts_expand(int, res->nlen+1, res->mlen, res->len);
+        res->len[res->nlen++] = res->buf.l - l0;
+    }
+}
+
 static void flush_bcf_records(mplp_conf_t *conf, htsFile *fp, bcf_hdr_t *hdr, bcf1_t *rec)
 {
+    if ( conf->par_res )
+    {
+        // running in a mpileup_parallel worker, gVCF is never enabled there
+        if ( rec ) mplp_serialize_rec(conf, hdr, rec);
+        return;
+    }
     if ( !conf->gvcf )
     {
         if ( rec && bcf_write1(fp, hdr, rec)!=0 ) error("[%s] Error: failed to write the record to %s\n", __func__,conf->output_fname?conf->output_fname:"standard output");
@@ -553,17 +612,31 @@ static void mplp_realn(int n, int *n_plp, const bam_pileup1_t **plp,
     return;
 }
 
-static int mpileup_reg(mplp_conf_t *conf, uint32_t beg, uint32_t end)
+// Process pileup columns in [beg,end] and output records for the columns at or
+// after emit_beg. Columns before emit_beg are processed as usual (e.g. for BAQ)
+// but nothing is output; mpileup_parallel uses this to reproduce the state the
+// reads would have in a single sequential run.
+static int mpileup_reg(mplp_conf_t *conf, hts_pos_t beg, hts_pos_t end, hts_pos_t emit_beg)
 {
     bam_hdr_t *hdr = conf->mplp_data[0]->h; // header of first file in input list
 
-    int ret, i, tid, pos, ref_len;
+    int ret, i, tid, pos, ref_len, rng_started = 0;
     char *ref;
 
     while ( (ret=bam_mplp_auto(conf->iter, &tid, &pos, conf->n_plp, conf->plp)) > 0)
     {
         if ( conf->progress && tid>=0 ) progress_update(conf->progress, hdr->target_name[tid], pos+1);
         if ( pos<beg || pos>end ) continue;
+        if ( conf->par_res && !rng_started && pos>=emit_beg )
+        {
+            // Genotype likelihoods at very deep sites are calculated from a random subset of
+            // reads. From now on draw the same random numbers as a sequential run would, see
+            // mpileup_parallel()
+            rng_started = 1;
+            memcpy(conf->par_rng_cur, conf->par_rng, sizeof(conf->par_rng));
+            conf->par_ndraw = 0;
+            hts_drand48_set_thread_state(conf->par_rng_cur, &conf->par_ndraw);
+        }
         if ( conf->bed && tid >= 0 )
         {
             int overlap = regidx_overlap(conf->bed, hdr->target_name[tid], pos, pos, NULL);
@@ -586,7 +659,7 @@ static int mpileup_reg(mplp_conf_t *conf, uint32_t beg, uint32_t end)
         bcf_call_combine(conf->gplp->n, conf->bcr, conf->bca, ref16, &conf->bc);
         bcf_clear1(conf->bcf_rec);
         bcf_call2bcf(&conf->bc, conf->bcf_rec, conf->bcr, conf->fmt_flag, conf->bca, 0);
-        flush_bcf_records(conf, conf->bcf_fp, conf->bcf_hdr, conf->bcf_rec);
+        if ( pos>=emit_beg ) flush_bcf_records(conf, conf->bcf_fp, conf->bcf_hdr, conf->bcf_rec);
 
         // call indels; todo: subsampling with total_depth>max_indel_depth instead of ignoring?
         // check me: rghash in bcf_call_gap_prep() should have no effect, reads mplp_func already excludes them
@@ -609,13 +682,102 @@ static int mpileup_reg(mplp_conf_t *conf, uint32_t beg, uint32_t end)
                 {
                     bcf_clear1(conf->bcf_rec);
                     bcf_call2bcf(&conf->bc, conf->bcf_rec, conf->bcr, conf->fmt_flag, conf->bca, ref);
-                    flush_bcf_records(conf, conf->bcf_fp, conf->bcf_hdr, conf->bcf_rec);
+                    if ( pos>=emit_beg ) flush_bcf_records(conf, conf->bcf_fp, conf->bcf_hdr, conf->bcf_rec);
                 }
             }
         }
     }
     return ret;
 }
+
+// Allocate the per-site calling structures, shared by the main thread and the
+// mpileup_parallel workers
+static void mplp_init_call(mplp_conf_t *conf, int nsmpl)
+{
+    int i;
+    conf->bca = bcf_call_init(-1., conf->min_baseQ, conf->max_baseQ,
+                              conf->delta_baseQ);
+    conf->bcr = (bcf_callret1_t*) calloc(nsmpl, sizeof(bcf_callret1_t));
+    conf->bca->openQ = conf->openQ, conf->bca->extQ = conf->extQ, conf->bca->tandemQ = conf->tandemQ;
+    conf->bca->indel_bias = conf->indel_bias;
+    conf->bca->del_bias = conf->del_bias;
+    conf->bca->min_frac = conf->min_frac;
+    conf->bca->min_support = conf->min_support;
+    conf->bca->per_sample_flt = conf->flag & MPLP_PER_SAMPLE;
+    conf->bca->fmt_flag = conf->fmt_flag;
+    conf->bca->ambig_reads = conf->ambig_reads;
+    conf->bca->indel_win_size = conf->indel_win_size;
+    conf->bca->indels_v20 = conf->indels_v20;
+    conf->bca->edlib = conf->edlib;
+    conf->bca->seqQ_offset = conf->seqQ_offset;
+    conf->bca->poly_mqual = conf->poly_mqual;
+    conf->bca->vs_ref = conf->vs_ref;
+
+    conf->bc.bcf_hdr = conf->bcf_hdr;
+    conf->bc.n  = nsmpl;
+    conf->bc.PL = (int32_t*) malloc(15 * nsmpl * sizeof(*conf->bc.PL));
+    conf->bc.QS = (int32_t*) malloc(nsmpl*sizeof(*conf->bc.QS)*B2B_MAX_ALLELES);
+    for (i=0; i<nsmpl; i++)
+        conf->bcr[i].QS = conf->bc.QS + i*B2B_MAX_ALLELES;
+    if (conf->fmt_flag)
+    {
+        assert( sizeof(float)==sizeof(int32_t) );
+        conf->bc.DP4 = (int32_t*) malloc(nsmpl * sizeof(int32_t) * 4);
+        conf->bc.fmt_arr = (uint8_t*) malloc(nsmpl * sizeof(float)); // all fmt_flag fields, float and int32
+        if ( conf->fmt_flag&(B2B_INFO_DPR|B2B_FMT_DPR|B2B_INFO_AD|B2B_INFO_ADF|B2B_INFO_ADR|B2B_FMT_AD|B2B_FMT_ADF|B2B_FMT_ADR) )
+        {
+            // first B2B_MAX_ALLELES fields for total numbers, the rest per-sample
+            conf->bc.ADR = (int32_t*) malloc((nsmpl+1)*B2B_MAX_ALLELES*sizeof(int32_t));
+            conf->bc.ADF = (int32_t*) malloc((nsmpl+1)*B2B_MAX_ALLELES*sizeof(int32_t));
+            for (i=0; i<nsmpl; i++)
+            {
+                conf->bcr[i].ADR = conf->bc.ADR + (i+1)*B2B_MAX_ALLELES;
+                conf->bcr[i].ADF = conf->bc.ADF + (i+1)*B2B_MAX_ALLELES;
+            }
+        }
+        if ( conf->fmt_flag&(B2B_INFO_SCR|B2B_FMT_SCR) )
+            conf->bc.SCR = (int32_t*) malloc((nsmpl+1)*sizeof(*conf->bc.SCR));
+        if ( conf->fmt_flag & B2B_FMT_QM )
+        {
+            double *tmp = (double*) malloc(nsmpl*B2B_MAX_ALLELES*sizeof(double));
+            conf->bc.QM = (int32_t*) malloc(nsmpl*B2B_MAX_ALLELES*sizeof(int32_t));
+            for (i=0; i<nsmpl; i++)
+                conf->bcr[i].QM = tmp + i*B2B_MAX_ALLELES;
+        }
+    }
+    int nnmbz = (conf->fmt_flag&B2B_FMT_NMBZ) ? nsmpl + 1 : 1;
+    conf->bc.ref_nm = (int32_t*) malloc(sizeof(*conf->bc.ref_nm) * nnmbz * B2B_N_NM);
+    conf->bc.alt_nm = (int32_t*) malloc(sizeof(*conf->bc.alt_nm) * nnmbz * B2B_N_NM);
+    conf->bc.mwu_nm = (float*) malloc((nsmpl+1)*sizeof(*conf->bc.mwu_nm));
+    conf->bca->ref_nm = conf->bc.ref_nm;     // this is just to make the arrays available in bcf_call_glfgen()
+    conf->bca->alt_nm = conf->bc.alt_nm;
+    if ( conf->fmt_flag&B2B_FMT_NMBZ )
+    {
+        for (i=0; i<nsmpl; i++) conf->bcr[i].ref_nm = conf->bc.ref_nm + (i+1)*B2B_N_NM;
+        for (i=0; i<nsmpl; i++) conf->bcr[i].alt_nm = conf->bc.alt_nm + (i+1)*B2B_N_NM;
+    }
+}
+
+static void mplp_destroy_call(mplp_conf_t *conf)
+{
+    free(conf->bc.tmp.s);
+    bcf_call_destroy(conf->bca);
+    free(conf->bc.PL);
+    free(conf->bc.DP4);
+    free(conf->bc.ADR);
+    free(conf->bc.ADF);
+    free(conf->bc.SCR);
+    free(conf->bc.QS);
+    free(conf->bc.QM);
+    free(conf->bcr[0].QM);
+    free(conf->bc.ref_nm);
+    free(conf->bc.alt_nm);
+    free(conf->bc.fmt_arr);
+    free(conf->bc.mwu_nm);
+    free(conf->bcr);
+}
+
+#include "mpileup_par.h"
 
 static int mpileup(mplp_conf_t *conf)
 {
@@ -874,67 +1036,7 @@ static int mpileup(mplp_conf_t *conf)
                      &conf->index_fn, conf->write_index) < 0 )
         error("Error: failed to initialise index for %s\n",conf->output_fname);
 
-    conf->bca = bcf_call_init(-1., conf->min_baseQ, conf->max_baseQ,
-                              conf->delta_baseQ);
-    conf->bcr = (bcf_callret1_t*) calloc(nsmpl, sizeof(bcf_callret1_t));
-    conf->bca->openQ = conf->openQ, conf->bca->extQ = conf->extQ, conf->bca->tandemQ = conf->tandemQ;
-    conf->bca->indel_bias = conf->indel_bias;
-    conf->bca->del_bias = conf->del_bias;
-    conf->bca->min_frac = conf->min_frac;
-    conf->bca->min_support = conf->min_support;
-    conf->bca->per_sample_flt = conf->flag & MPLP_PER_SAMPLE;
-    conf->bca->fmt_flag = conf->fmt_flag;
-    conf->bca->ambig_reads = conf->ambig_reads;
-    conf->bca->indel_win_size = conf->indel_win_size;
-    conf->bca->indels_v20 = conf->indels_v20;
-    conf->bca->edlib = conf->edlib;
-    conf->bca->seqQ_offset = conf->seqQ_offset;
-    conf->bca->poly_mqual = conf->poly_mqual;
-    conf->bca->vs_ref = conf->vs_ref;
-
-    conf->bc.bcf_hdr = conf->bcf_hdr;
-    conf->bc.n  = nsmpl;
-    conf->bc.PL = (int32_t*) malloc(15 * nsmpl * sizeof(*conf->bc.PL));
-    conf->bc.QS = (int32_t*) malloc(nsmpl*sizeof(*conf->bc.QS)*B2B_MAX_ALLELES);
-    for (i=0; i<nsmpl; i++)
-        conf->bcr[i].QS = conf->bc.QS + i*B2B_MAX_ALLELES;
-    if (conf->fmt_flag)
-    {
-        assert( sizeof(float)==sizeof(int32_t) );
-        conf->bc.DP4 = (int32_t*) malloc(nsmpl * sizeof(int32_t) * 4);
-        conf->bc.fmt_arr = (uint8_t*) malloc(nsmpl * sizeof(float)); // all fmt_flag fields, float and int32
-        if ( conf->fmt_flag&(B2B_INFO_DPR|B2B_FMT_DPR|B2B_INFO_AD|B2B_INFO_ADF|B2B_INFO_ADR|B2B_FMT_AD|B2B_FMT_ADF|B2B_FMT_ADR) )
-        {
-            // first B2B_MAX_ALLELES fields for total numbers, the rest per-sample
-            conf->bc.ADR = (int32_t*) malloc((nsmpl+1)*B2B_MAX_ALLELES*sizeof(int32_t));
-            conf->bc.ADF = (int32_t*) malloc((nsmpl+1)*B2B_MAX_ALLELES*sizeof(int32_t));
-            for (i=0; i<nsmpl; i++)
-            {
-                conf->bcr[i].ADR = conf->bc.ADR + (i+1)*B2B_MAX_ALLELES;
-                conf->bcr[i].ADF = conf->bc.ADF + (i+1)*B2B_MAX_ALLELES;
-            }
-        }
-        if ( conf->fmt_flag&(B2B_INFO_SCR|B2B_FMT_SCR) )
-            conf->bc.SCR = (int32_t*) malloc((nsmpl+1)*sizeof(*conf->bc.SCR));
-        if ( conf->fmt_flag & B2B_FMT_QM )
-        {
-            double *tmp = (double*) malloc(nsmpl*B2B_MAX_ALLELES*sizeof(double));
-            conf->bc.QM = (int32_t*) malloc(nsmpl*B2B_MAX_ALLELES*sizeof(int32_t));
-            for (i=0; i<nsmpl; i++)
-                conf->bcr[i].QM = tmp + i*B2B_MAX_ALLELES;
-        }
-    }
-    int nnmbz = (conf->fmt_flag&B2B_FMT_NMBZ) ? nsmpl + 1 : 1;
-    conf->bc.ref_nm = (int32_t*) malloc(sizeof(*conf->bc.ref_nm) * nnmbz * B2B_N_NM);
-    conf->bc.alt_nm = (int32_t*) malloc(sizeof(*conf->bc.alt_nm) * nnmbz * B2B_N_NM);
-    conf->bc.mwu_nm = (float*) malloc((nsmpl+1)*sizeof(*conf->bc.mwu_nm));
-    conf->bca->ref_nm = conf->bc.ref_nm;     // this is just to make the arrays available in bcf_call_glfgen()
-    conf->bca->alt_nm = conf->bc.alt_nm;
-    if ( conf->fmt_flag&B2B_FMT_NMBZ )
-    {
-        for (i=0; i<nsmpl; i++) conf->bcr[i].ref_nm = conf->bc.ref_nm + (i+1)*B2B_N_NM;
-        for (i=0; i<nsmpl; i++) conf->bcr[i].alt_nm = conf->bc.alt_nm + (i+1)*B2B_N_NM;
-    }
+    mplp_init_call(conf, nsmpl);
 
     // init mpileup
     conf->iter = bam_mplp_init(conf->nfiles, mplp_func, (void**)conf->mplp_data);
@@ -961,7 +1063,9 @@ static int mpileup(mplp_conf_t *conf)
 
     // Run mpileup for multiple regions
     int ret = 0;
-    if ( nregs )
+    if ( mpileup_parallel_ok(conf, nregs) )
+        ret = mpileup_parallel(conf, hdr, nregs);
+    else if ( nregs )
     {
         int ireg = 0;
         do
@@ -989,13 +1093,13 @@ static int mpileup(mplp_conf_t *conf)
                     bam_mplp_reset(conf->iter);
                 }
             }
-            ret = mpileup_reg(conf,conf->reg_itr->beg,conf->reg_itr->end);
+            ret = mpileup_reg(conf,conf->reg_itr->beg,conf->reg_itr->end,conf->reg_itr->beg);
             if ( ret<0 ) break;
         }
         while ( regitr_loop(conf->reg_itr) );
     }
     else if ( !conf->reg )
-        ret = mpileup_reg(conf,0,UINT32_MAX);
+        ret = mpileup_reg(conf,0,UINT32_MAX,0);
     if ( ret<0 )
     {
         fprintf(stderr, "[%s] failed to read from input file\n", __func__);
@@ -1005,7 +1109,6 @@ static int mpileup(mplp_conf_t *conf)
     flush_bcf_records(conf, conf->bcf_fp, conf->bcf_hdr, NULL);
 
     // clean up
-    free(conf->bc.tmp.s);
     bcf_destroy1(conf->bcf_rec);
     if (conf->bcf_fp)
     {
@@ -1020,20 +1123,7 @@ static int mpileup(mplp_conf_t *conf)
         }
         if ( hts_close(conf->bcf_fp)!=0 ) error("[%s] Error: close failed .. %s\n", __func__,conf->output_fname);
         bcf_hdr_destroy(conf->bcf_hdr);
-        bcf_call_destroy(conf->bca);
-        free(conf->bc.PL);
-        free(conf->bc.DP4);
-        free(conf->bc.ADR);
-        free(conf->bc.ADF);
-        free(conf->bc.SCR);
-        free(conf->bc.QS);
-        free(conf->bc.QM);
-        free(conf->bcr[0].QM);
-        free(conf->bc.ref_nm);
-        free(conf->bc.alt_nm);
-        free(conf->bc.fmt_arr);
-        free(conf->bc.mwu_nm);
-        free(conf->bcr);
+        mplp_destroy_call(conf);
     }
     if ( conf->gvcf ) gvcf_destroy(conf->gvcf);
     free(conf->buf.s);
@@ -1288,7 +1378,8 @@ static void print_usage(FILE *fp, const mplp_conf_t *mplp)
         "  -O, --output-type TYPE  'b' compressed BCF; 'u' uncompressed BCF;\n"
         "                          'z' compressed VCF; 'v' uncompressed VCF; 0-9 compression level [v]\n"
         "      --progress[=INT]    Print the current position (CHR:POS) to stderr every INT seconds [60]\n"
-        "      --threads INT       Use multithreading with INT worker threads [0]\n"
+        "      --threads INT       Use multithreading with INT worker threads; with indexed input files\n"
+        "                          the pileup is processed in parallel, the output is unchanged [0]\n"
         "  -v, --verbosity INT     Verbosity level\n"
         "  -W, --write-index[=FMT] Automatically index the output files [off]\n"
         "\n"
