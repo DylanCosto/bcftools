@@ -3072,7 +3072,10 @@ By default, appropriate system directories are searched for installed plugins.
 
 *split-vep*::
     extract fields from structured annotations such as INFO/CSQ created by VEP or INFO/BCSQ created by
-    bcftools/csq. These can be added as a new INFO field to the VCF or in a custom text format. See
+    bcftools/csq. These can be added as a new INFO field to the VCF or in a custom text format.
+    Numeric fields containing ampersand-separated values retain only the leading numeric
+    value for each transcript and produce a warning once per field. Use
+    `-c FIELD:Str` to preserve the complete value for such a field. See
     <http://samtools.github.io/bcftools/howtos/plugin.split-vep.html> for more.
 
 *tag2tag*::
